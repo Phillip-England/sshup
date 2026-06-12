@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -356,7 +356,7 @@ fn execute_action(terminal: &mut Tui, action: &Action) -> Result<String> {
                     .args(["-t", "ed25519", "-a", "100", "-f", path, "-C", comment]),
             )?;
             Ok(format!(
-                "Generated keypair at {path}. Add {path}.pub to the target user's authorized_keys."
+                "Generated a local keypair for the person running shhup.\n\nPrivate key:\n{path}\n\nPublic key:\n{path}.pub\n\nTo let a server user log in with this key, append the public key to that user's ~/.ssh/authorized_keys on the server."
             ))
         }
         Action::CreateUser { username } => {
@@ -376,37 +376,31 @@ fn execute_action(terminal: &mut Tui, action: &Action) -> Result<String> {
             fs::write(&temp_path, HARDENED_SSHD_CONFIG)
                 .with_context(|| format!("failed to write {}", temp_path.display()))?;
 
-            run_interactive(
-                terminal,
-                Command::new("sudo").args([
-                    "install",
-                    "-d",
-                    "-m",
-                    "0755",
-                    "/etc/ssh/sshd_config.d",
-                ]),
-            )?;
-            run_interactive(
-                terminal,
+            run_interactive(terminal, Command::new("sudo").arg("-v"))?;
+            run_captured(Command::new("sudo").args([
+                "-n",
+                "install",
+                "-d",
+                "-m",
+                "0755",
+                "/etc/ssh/sshd_config.d",
+            ]))?;
+            run_captured(
                 Command::new("sudo")
+                    .arg("-n")
                     .arg("install")
                     .arg("-m")
                     .arg("0644")
                     .arg(&temp_path)
                     .arg(SSHD_DROPIN_PATH),
             )?;
-            run_interactive(terminal, Command::new("sudo").args(["sshd", "-t"]))?;
+            run_captured(Command::new("sudo").args(["-n", "sshd", "-t"]))?;
 
-            if run_interactive(
-                terminal,
-                Command::new("sudo").args(["systemctl", "reload", "sshd"]),
-            )
-            .is_err()
+            if let Err(systemctl_error) =
+                run_captured(Command::new("sudo").args(["-n", "systemctl", "reload", "sshd"]))
             {
-                run_interactive(
-                    terminal,
-                    Command::new("sudo").args(["service", "ssh", "reload"]),
-                )?;
+                run_captured(Command::new("sudo").args(["-n", "service", "ssh", "reload"]))
+                    .with_context(|| format!("systemctl reload also failed:\n{systemctl_error}"))?;
             }
 
             let _ = fs::remove_file(temp_path);
@@ -418,16 +412,77 @@ fn execute_action(terminal: &mut Tui, action: &Action) -> Result<String> {
 }
 
 fn run_interactive(terminal: &mut Tui, command: &mut Command) -> Result<()> {
+    let command_display = command_display(command);
     suspend_terminal(terminal)?;
     let status = command.status();
     resume_terminal(terminal)?;
 
-    let status = status.context("failed to start command")?;
+    let status = status.with_context(|| format!("failed to start command: {command_display}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(anyhow!("command exited with status {status}"))
+        Err(anyhow!(
+            "command failed: {command_display}\nstatus: {status}"
+        ))
     }
+}
+
+fn run_captured(command: &mut Command) -> Result<()> {
+    let command_display = command_display(command);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to start command: {command_display}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{}",
+            command_failure_message(&command_display, &output)
+        ))
+    }
+}
+
+fn command_display(command: &Command) -> String {
+    let mut parts = vec![command.get_program().to_string_lossy().to_string()];
+    parts.extend(
+        command
+            .get_args()
+            .map(|arg| shellish_quote(&arg.to_string_lossy())),
+    );
+    parts.join(" ")
+}
+
+fn shellish_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn command_failure_message(command_display: &str, output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut message = format!(
+        "command failed: {command_display}\nstatus: {}",
+        output.status
+    );
+
+    if !stdout.trim().is_empty() {
+        message.push_str("\n\nstdout:\n");
+        message.push_str(stdout.trim());
+    }
+
+    if !stderr.trim().is_empty() {
+        message.push_str("\n\nstderr:\n");
+        message.push_str(stderr.trim());
+    }
+
+    message
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
@@ -460,11 +515,15 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
                 frame,
                 chunks[1],
                 "Generate SSH key",
+                &[
+                    "Creates a private/public keypair on this machine for the person running shhup.",
+                    "To use it, copy the .pub file into the target server user's authorized_keys.",
+                ],
                 &["Private key path", "Key comment"],
                 &values,
                 *field,
             );
-            set_form_cursor(frame, chunks[1], *field, values[*field]);
+            set_form_cursor(frame, chunks[1], 2, *field, values[*field]);
         }
         Screen::CreateUser { username } => {
             let values = [username.as_str()];
@@ -472,11 +531,15 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
                 frame,
                 chunks[1],
                 "Create non-root user",
+                &[
+                    "Creates a Linux account on this server.",
+                    "This is usually the user named in ssh user@host and owns ~/.ssh/authorized_keys.",
+                ],
                 &["Username"],
                 &values,
                 0,
             );
-            set_form_cursor(frame, chunks[1], 0, values[0]);
+            set_form_cursor(frame, chunks[1], 2, 0, values[0]);
         }
         Screen::Connection {
             username,
@@ -489,11 +552,15 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
                 frame,
                 chunks[1],
                 "Connection command",
+                &[
+                    "Builds the command to connect from this machine to the server.",
+                    "Username is the server user; private key path is the matching local private key.",
+                ],
                 &["Username", "Host", "Private key path"],
                 &values,
                 *field,
             );
-            set_form_cursor(frame, chunks[1], *field, values[*field]);
+            set_form_cursor(frame, chunks[1], 2, *field, values[*field]);
         }
         Screen::Confirm { action } => draw_confirm(frame, chunks[1], action),
         Screen::Message { title, body } => draw_message(frame, chunks[1], title, body),
@@ -539,30 +606,42 @@ fn draw_form(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
+    help: &[&str],
     labels: &[&str],
     values: &[&str],
     active: usize,
 ) {
-    let lines = labels
+    let mut lines = help
         .iter()
-        .zip(values.iter())
-        .enumerate()
-        .flat_map(|(idx, (label, value))| {
-            let marker = if idx == active { ">" } else { " " };
-            let style = if idx == active {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            [
-                Line::from(Span::styled(format!("{marker} {label}"), style)),
-                Line::from(format!("  {value}")),
-                Line::from(""),
-            ]
-        })
+        .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::DarkGray))))
         .collect::<Vec<_>>();
+
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    lines.extend(
+        labels
+            .iter()
+            .zip(values.iter())
+            .enumerate()
+            .flat_map(|(idx, (label, value))| {
+                let marker = if idx == active { ">" } else { " " };
+                let style = if idx == active {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                [
+                    Line::from(Span::styled(format!("{marker} {label}"), style)),
+                    Line::from(format!("  {value}")),
+                    Line::from(""),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -572,7 +651,13 @@ fn draw_form(
     );
 }
 
-fn set_form_cursor(frame: &mut Frame<'_>, area: Rect, active: usize, value: &str) {
+fn set_form_cursor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    help_lines: usize,
+    active: usize,
+    value: &str,
+) {
     let content_x = area.x.saturating_add(1);
     let content_y = area.y.saturating_add(1);
     let max_x = area.right().saturating_sub(2);
@@ -580,7 +665,12 @@ fn set_form_cursor(frame: &mut Frame<'_>, area: Rect, active: usize, value: &str
         .saturating_add(2)
         .saturating_add(value.chars().count() as u16)
         .min(max_x);
-    let y = content_y.saturating_add((active as u16).saturating_mul(3).saturating_add(1));
+    let help_offset = if help_lines == 0 { 0 } else { help_lines + 1 };
+    let y = content_y.saturating_add(
+        (help_offset as u16)
+            .saturating_add((active as u16).saturating_mul(3))
+            .saturating_add(1),
+    );
 
     if area.contains(ratatui::layout::Position { x, y }) {
         frame.set_cursor_position(ratatui::layout::Position { x, y });
@@ -752,5 +842,19 @@ mod tests {
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
         )));
+    }
+
+    #[test]
+    fn shellish_quote_preserves_simple_command_parts() {
+        assert_eq!(
+            shellish_quote("/etc/ssh/sshd_config.d"),
+            "/etc/ssh/sshd_config.d"
+        );
+        assert_eq!(shellish_quote("reload"), "reload");
+    }
+
+    #[test]
+    fn shellish_quote_quotes_spaces() {
+        assert_eq!(shellish_quote("needs space"), "'needs space'");
     }
 }
