@@ -5,8 +5,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::cursor::Show;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -111,6 +111,11 @@ fn run_app(terminal: &mut Tui) -> Result<()> {
 }
 
 fn handle_key(terminal: &mut Tui, app: &mut App, key: KeyEvent) -> Result<()> {
+    if is_force_quit_key(key) {
+        app.should_quit = true;
+        return Ok(());
+    }
+
     let screen = app.screen.clone();
     match screen {
         Screen::Home => handle_home_key(app, key),
@@ -185,10 +190,16 @@ fn handle_generate_key(
     mut field: usize,
 ) -> Result<()> {
     match key.code {
-        KeyCode::Esc => app.screen = Screen::Home,
-        KeyCode::Tab | KeyCode::Down | KeyCode::Up => field = 1 - field,
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.screen = Screen::Home;
+            return Ok(());
+        }
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => field = 1 - field,
         KeyCode::Backspace => {
             active_input_mut(field, &mut path, &mut comment).pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            active_input_mut(field, &mut path, &mut comment).clear();
         }
         KeyCode::Char(c) => active_input_mut(field, &mut path, &mut comment).push(c),
         KeyCode::Enter => {
@@ -222,11 +233,22 @@ fn handle_generate_key(
 
 fn handle_create_user(app: &mut App, key: KeyEvent, mut username: String) -> Result<()> {
     match key.code {
-        KeyCode::Esc => app.screen = Screen::Home,
+        KeyCode::Esc | KeyCode::Char('q') => app.screen = Screen::Home,
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
+            app.screen = Screen::CreateUser { username };
+        }
         KeyCode::Backspace => {
             username.pop();
+            app.screen = Screen::CreateUser { username };
         }
-        KeyCode::Char(c) => username.push(c),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            username.clear();
+            app.screen = Screen::CreateUser { username };
+        }
+        KeyCode::Char(c) => {
+            username.push(c);
+            app.screen = Screen::CreateUser { username };
+        }
         KeyCode::Enter => match validate_username(&username) {
             Ok(()) => {
                 app.screen = Screen::Confirm {
@@ -251,11 +273,17 @@ fn handle_connection(
     mut field: usize,
 ) -> Result<()> {
     match key.code {
-        KeyCode::Esc => app.screen = Screen::Home,
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.screen = Screen::Home;
+            return Ok(());
+        }
         KeyCode::Tab | KeyCode::Down => field = (field + 1) % 3,
-        KeyCode::Up => field = field.checked_sub(1).unwrap_or(2),
+        KeyCode::BackTab | KeyCode::Up => field = field.checked_sub(1).unwrap_or(2),
         KeyCode::Backspace => {
             connection_input_mut(field, &mut username, &mut host, &mut key_path).pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            connection_input_mut(field, &mut username, &mut host, &mut key_path).clear();
         }
         KeyCode::Char(c) => {
             connection_input_mut(field, &mut username, &mut host, &mut key_path).push(c)
@@ -292,10 +320,17 @@ fn handle_confirm(terminal: &mut Tui, app: &mut App, key: KeyEvent, action: Acti
                 Err(error) => message("Action failed", error.to_string()),
             };
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.screen = Screen::Home,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {
+            app.screen = Screen::Home
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn is_force_quit_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
 }
 
 fn execute_action(terminal: &mut Tui, action: &Action) -> Result<String> {
@@ -419,42 +454,56 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
             path,
             comment,
             field,
-        } => draw_form(
-            frame,
-            chunks[1],
-            "Generate SSH key",
-            &["Private key path", "Key comment"],
-            &[path, comment],
-            *field,
-        ),
-        Screen::CreateUser { username } => draw_form(
-            frame,
-            chunks[1],
-            "Create non-root user",
-            &["Username"],
-            &[username],
-            0,
-        ),
+        } => {
+            let values = [path.as_str(), comment.as_str()];
+            draw_form(
+                frame,
+                chunks[1],
+                "Generate SSH key",
+                &["Private key path", "Key comment"],
+                &values,
+                *field,
+            );
+            set_form_cursor(frame, chunks[1], *field, values[*field]);
+        }
+        Screen::CreateUser { username } => {
+            let values = [username.as_str()];
+            draw_form(
+                frame,
+                chunks[1],
+                "Create non-root user",
+                &["Username"],
+                &values,
+                0,
+            );
+            set_form_cursor(frame, chunks[1], 0, values[0]);
+        }
         Screen::Connection {
             username,
             host,
             key_path,
             field,
-        } => draw_form(
-            frame,
-            chunks[1],
-            "Connection command",
-            &["Username", "Host", "Private key path"],
-            &[username, host, key_path],
-            *field,
-        ),
+        } => {
+            let values = [username.as_str(), host.as_str(), key_path.as_str()];
+            draw_form(
+                frame,
+                chunks[1],
+                "Connection command",
+                &["Username", "Host", "Private key path"],
+                &values,
+                *field,
+            );
+            set_form_cursor(frame, chunks[1], *field, values[*field]);
+        }
         Screen::Confirm { action } => draw_confirm(frame, chunks[1], action),
         Screen::Message { title, body } => draw_message(frame, chunks[1], title, body),
     }
 
     frame.render_widget(
-        Paragraph::new("q/Esc quit or back  Enter select/submit  Tab switch fields  y/n confirm")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(
+            "q/Esc back  Ctrl+C quit  Enter select/submit  Tab switch fields  Ctrl+U clear",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
 }
@@ -523,6 +572,21 @@ fn draw_form(
     );
 }
 
+fn set_form_cursor(frame: &mut Frame<'_>, area: Rect, active: usize, value: &str) {
+    let content_x = area.x.saturating_add(1);
+    let content_y = area.y.saturating_add(1);
+    let max_x = area.right().saturating_sub(2);
+    let x = content_x
+        .saturating_add(2)
+        .saturating_add(value.chars().count() as u16)
+        .min(max_x);
+    let y = content_y.saturating_add((active as u16).saturating_mul(3).saturating_add(1));
+
+    if area.contains(ratatui::layout::Position { x, y }) {
+        frame.set_cursor_position(ratatui::layout::Position { x, y });
+    }
+}
+
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, action: &Action) {
     let body = match action {
         Action::GenerateKey { path, comment } => format!(
@@ -584,7 +648,7 @@ fn connection_input_mut<'a>(
 fn start_terminal() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, Hide)?;
+    execute!(stdout, EnterAlternateScreen)?;
     Terminal::new(CrosstermBackend::new(stdout)).context("failed to initialize terminal")
 }
 
@@ -603,7 +667,90 @@ fn suspend_terminal(terminal: &mut Tui) -> Result<()> {
 
 fn resume_terminal(terminal: &mut Tui) -> Result<()> {
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen, Hide)?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.clear()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn q_and_esc_leave_generate_key_form() {
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut app = App::default();
+
+            handle_generate_key(
+                &mut app,
+                key(code),
+                "/tmp/key".to_string(),
+                "comment".to_string(),
+                0,
+            )
+            .unwrap();
+
+            assert!(matches!(app.screen, Screen::Home));
+        }
+    }
+
+    #[test]
+    fn tab_switches_generate_key_fields() {
+        let mut app = App::default();
+
+        handle_generate_key(
+            &mut app,
+            key(KeyCode::Tab),
+            "/tmp/key".to_string(),
+            "comment".to_string(),
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(app.screen, Screen::GenerateKey { field: 1, .. }));
+    }
+
+    #[test]
+    fn create_user_tab_keeps_field_editable() {
+        let mut app = App::default();
+
+        handle_create_user(&mut app, key(KeyCode::Tab), "deploy".to_string()).unwrap();
+        handle_create_user(&mut app, key(KeyCode::Backspace), "deploy".to_string()).unwrap();
+
+        match app.screen {
+            Screen::CreateUser { username } => assert_eq!(username, "deplo"),
+            _ => panic!("expected create user form"),
+        }
+    }
+
+    #[test]
+    fn q_and_esc_leave_connection_form() {
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut app = App::default();
+
+            handle_connection(
+                &mut app,
+                key(code),
+                "deploy".to_string(),
+                "server.example.com".to_string(),
+                "/tmp/key".to_string(),
+                1,
+            )
+            .unwrap();
+
+            assert!(matches!(app.screen, Screen::Home));
+        }
+    }
+
+    #[test]
+    fn ctrl_c_is_force_quit_key() {
+        assert!(is_force_quit_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+    }
 }
