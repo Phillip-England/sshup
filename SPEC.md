@@ -45,3 +45,7 @@ If doing this is not possible, then opt out of firewall support all together. It
 # Help With Installation of ssh Software
 
 This system should not assume the user has ssh server installed. You should offer a way for them to install it very easily using this system as well. That way this system is a one-stop-shop for all ssh needs, including installation.
+
+# Very Clear Quickstart in README
+
+We need to ensure the README includes a very clear quickstart which enables us to get ssh up and running on another system and then also establishing a connection with the ssh'ed system from the client using a key. This quickstart should include everything from user creation to key generation to setting up our firewall and fail2ban the whole lot. This readme should be so clear even an idiot who has never used a program before should be able to accomplish. 
